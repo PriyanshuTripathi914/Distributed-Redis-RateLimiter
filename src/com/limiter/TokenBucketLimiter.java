@@ -1,71 +1,70 @@
 package com.limiter;
 
 import redis.clients.jedis.Jedis;
-import java.util.Map;
-import java.util.HashMap;
+import java.util.Collections;
+import java.util.Arrays;
 
 public class TokenBucketLimiter {
-    private final int maxCapacity;
-    private final int refillRatePerSecond;
+    private final String maxCapacity;
+    private final String refillRate;
+
+    // lua script
+    private final String luaScript = """
+    local key = KEYS[1]
+    local max_capacity = tonumber(ARGV[1])
+    local refill_rate = tonumber(ARGV[2])
+    local current_time = tonumber(ARGV[3])
+
+    -- Fetch existing rate limit metrics for the user
+    local bucket = redis.call('HMGET', key, 'tokens', 'last_refill_time')
+    local current_tokens = tonumber(bucket[1])
+    local last_refill_time = tonumber(bucket[2])
+
+    -- If the user hash is empty, initialize a fresh full bucket
+    if not current_tokens then
+        current_tokens = max_capacity
+        last_refill_time = current_time
+    else
+        -- Compute lazy refilling based on time elapsed since last check
+        local elapsed_time = current_time - last_refill_time
+        if elapsed_time > 0 then
+            local tokens_to_add = elapsed_time * refill_rate
+            current_tokens = math.min(max_capacity, current_tokens + tokens_to_add)
+            last_refill_time = current_time
+        end
+    end
+
+    -- Process request evaluation atomatically
+    if current_tokens >= 1 then
+        current_tokens = current_tokens - 1
+        redis.call('HMSET', key, 'tokens', current_tokens, 'last_refill_time', last_refill_time)
+        return 1  -- ALLOWED (200 OK)
+    else
+        return 0  -- BLOCKED (429 Too Many Requests)
+    end
+    """;
 
     public TokenBucketLimiter(int maxCapacity, int refillRatePerSecond) {
-        this.maxCapacity = maxCapacity;
-        this.refillRatePerSecond = refillRatePerSecond;
+        this.maxCapacity = String.valueOf(maxCapacity);
+        this.refillRate = String.valueOf(refillRatePerSecond);
     }
 
-    /**
-     * Determines whether a specific client request is allowed through or blocked.
-     * @param clientKey Unique identifier (e.g., client IP or username)
-     * @return true if allowed, false if rate-limited
-     */
     public boolean allowRequest(String clientKey) {
         String redisKey = "rate_limit:" + clientKey;
-        long currentTimeSeconds = System.currentTimeMillis() / 1000;
+        String currentTimeSeconds = String.valueOf(System.currentTimeMillis() / 1000);
 
         try (Jedis redis = RedisManager.getConnection()) {
-            // Retrieve current bucket values from Redis (stored as a Hash Map)
-            Map<String, String> bucketData = redis.hgetAll(redisKey);
+            // Execute the script atomically inside the Redis engine
+            Object result = redis.eval(
+                luaScript, 
+                Collections.singletonList(redisKey), 
+                Arrays.asList(maxCapacity, refillRate, currentTimeSeconds)
+            );
 
-            double currentTokens;
-            long lastRefillTime;
-
-            // If the client doesn't exist in Redis yet, initialize a brand new full bucket
-            if (bucketData == null || bucketData.isEmpty()) {
-                currentTokens = maxCapacity;
-                lastRefillTime = currentTimeSeconds;
-            } else {
-                // Parse existing data out of the Redis hash maps
-                currentTokens = Double.parseDouble(bucketData.get("tokens"));
-                lastRefillTime = Long.parseLong(bucketData.get("last_refill_time"));
-
-                // Calculate elapsed time and dynamically refill tokens lazily
-                long elapsedTime = currentTimeSeconds - lastRefillTime;
-                if (elapsedTime > 0) {
-                    double tokensToAdd = elapsedTime * refillRatePerSecond;
-                    currentTokens = Math.min(maxCapacity, currentTokens + tokensToAdd);
-                    lastRefillTime = currentTimeSeconds;
-                }
-            }
-
-            // Check if the bucket has enough tokens to service this request
-            if (currentTokens >= 1.0) {
-                currentTokens -= 1.0; // Deduct one token
-
-                // Update the updated values back into Redis
-                Map<String, String> updatedData = new HashMap<>();
-                updatedData.put("tokens", String.valueOf(currentTokens));
-                updatedData.put("last_refill_time", String.valueOf(lastRefillTime));
-                redis.hmset(redisKey, updatedData);
-
-                return true; // Request allowed!
-            }
-
-            // Not enough tokens left in the bucket
-            return false; // Rate limited!
-
+            return result.toString().equals("1");
         } catch (Exception e) {
-            System.err.println("[ERROR] Token Bucket execution error: " + e.getMessage());
-            return true; // Fail-open strategy: allow traffic if the limiter crashes
+            System.err.println("[ERROR] Lua Execution Script Failed: " + e.getMessage());
+            return true; // Fail-open strategy
         }
     }
 }
